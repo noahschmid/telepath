@@ -1,0 +1,15 @@
+[package]
+name = "telepath-host"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "telepath-host"
+
+[dependencies]
+common    = { path = "../common" }
+tokio     = { workspace = true }
+ringbuf   = { workspace = true }
+cpal      = "0.15"
+iced      = { version = "0.13", features = ["tokio"] }
+thiserror = "1"
