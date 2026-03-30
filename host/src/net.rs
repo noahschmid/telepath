@@ -65,9 +65,13 @@ async fn run_server(
     tx: &mut iced::futures::channel::mpsc::Sender<Message>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let socket = tokio::net::TcpSocket::new_v4()?;
+    // On Linux: SO_REUSEADDR allows rebind after restart without waiting for TIME_WAIT.
+    // On Windows: SO_REUSEADDR would allow port stealing by other processes — skip it
+    // and use SO_EXCLUSIVEADDRUSE implicitly (Windows default when REUSEADDR is not set).
+    #[cfg(not(target_os = "windows"))]
     socket.set_reuseaddr(true)?;
     socket.bind(format!("0.0.0.0:{DEFAULT_PORT}").parse()?)?;
-    let listener = socket.listen(1)?;
+    let listener = socket.listen(4)?;
     eprintln!("[host] listening on :{DEFAULT_PORT}");
 
     loop {

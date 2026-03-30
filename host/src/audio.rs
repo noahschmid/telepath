@@ -1,4 +1,4 @@
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, HostTrait};
 use iced::futures::stream;
 
 use crate::app::Message;
@@ -127,6 +127,7 @@ fn capture_thread(
     let stream_result = match config.sample_format() {
         cpal::SampleFormat::F32 => build_stream::<f32>(&device, &config.into(), audio_tx),
         cpal::SampleFormat::I16 => build_stream::<i16>(&device, &config.into(), audio_tx),
+        cpal::SampleFormat::I32 => build_stream::<i32>(&device, &config.into(), audio_tx),
         cpal::SampleFormat::U16 => build_stream::<u16>(&device, &config.into(), audio_tx),
         fmt => {
             eprintln!("[audio] unsupported format: {fmt:?}");
@@ -156,19 +157,43 @@ fn capture_thread(
     drop(stream);
 }
 
+/// Converts any supported cpal sample type to f32 in [-1.0, 1.0].
+trait ToF32Sample: Copy {
+    fn to_f32_sample(self) -> f32;
+}
+impl ToF32Sample for f32 {
+    fn to_f32_sample(self) -> f32 {
+        self
+    }
+}
+impl ToF32Sample for i16 {
+    fn to_f32_sample(self) -> f32 {
+        self as f32 / i16::MAX as f32
+    }
+}
+impl ToF32Sample for i32 {
+    fn to_f32_sample(self) -> f32 {
+        self as f32 / i32::MAX as f32
+    }
+}
+impl ToF32Sample for u16 {
+    fn to_f32_sample(self) -> f32 {
+        (self as f32 / u16::MAX as f32) * 2.0 - 1.0
+    }
+}
+
 fn build_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     tx: tokio::sync::mpsc::Sender<Vec<f32>>,
 ) -> Result<cpal::Stream, CaptureError>
 where
-    T: cpal::Sample + cpal::SizedSample + Send + 'static,
-    f32: From<T>,
+    T: cpal::Sample + cpal::SizedSample + ToF32Sample + Send + 'static,
 {
     let stream = device.build_input_stream(
         config,
         move |data: &[T], _| {
-            let frames: Vec<f32> = data.iter().map(|&s| f32::from(s)).collect();
+            let frames: Vec<f32> = data.iter().map(|s| s.to_f32_sample()).collect();
             let _ = tx.try_send(frames);
         },
         |err| eprintln!("[audio] stream error: {err}"),
