@@ -3,27 +3,27 @@ use iced::{Color, Element, Subscription, Task, Theme};
 
 use crate::{audio, net};
 
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerState {
-    /// TCP server is bound and waiting for a plugin connection.
     Listening,
-    /// Plugin connected, not yet streaming.
     Connected(String),
-    /// Actively capturing and streaming audio to the plugin.
     Recording(String),
 }
 
 #[derive(Debug)]
 pub struct App {
+    // Capture (mic → receiver)
     devices: Vec<String>,
     selected_device: Option<String>,
     server_state: ServerState,
     level_db: f32,
     rtt_ms: Option<f32>,
+
+    // Monitoring (DAW playback → Scarlett)
+    output_devices: Vec<String>,
+    selected_output: Option<String>,
+    monitoring: bool,
+
     error: Option<String>,
 }
 
@@ -35,31 +35,31 @@ impl Default for App {
             server_state: ServerState::Listening,
             level_db: -60.0,
             rtt_ms: None,
+            output_devices: vec![],
+            selected_output: None,
+            monitoring: false,
             error: None,
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Messages
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone)]
 pub enum Message {
+    // Capture side
     DevicesLoaded(Vec<String>),
     DeviceSelected(String),
-    /// Plugin connected from the given IP address.
     PluginConnected(String),
     PluginDisconnected,
     RecordToggled,
     LevelUpdated(f32),
     RttUpdated(f32),
     ServerError(String),
-}
 
-// ---------------------------------------------------------------------------
-// Update
-// ---------------------------------------------------------------------------
+    // Monitoring side
+    OutputDevicesLoaded(Vec<String>),
+    OutputDeviceSelected(String),
+    MonitorToggled,
+}
 
 impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -75,12 +75,29 @@ impl App {
                 net::set_device(Some(dev.clone()));
                 self.selected_device = Some(dev);
             }
+            Message::OutputDevicesLoaded(devs) => {
+                if self.selected_output.is_none() {
+                    self.selected_output = devs.first().cloned();
+                    net::set_output_device(self.selected_output.clone());
+                }
+                self.output_devices = devs;
+            }
+            Message::OutputDeviceSelected(dev) => {
+                net::set_output_device(Some(dev.clone()));
+                self.selected_output = Some(dev);
+            }
+            Message::MonitorToggled => {
+                self.monitoring = !self.monitoring;
+                net::set_monitoring(self.monitoring);
+            }
             Message::PluginConnected(addr) => {
                 self.server_state = ServerState::Connected(addr);
                 self.error = None;
             }
             Message::PluginDisconnected => {
                 net::set_recording(false);
+                net::set_monitoring(false);
+                self.monitoring = false;
                 self.server_state = ServerState::Listening;
                 self.rtt_ms = None;
                 self.level_db = -60.0;
@@ -104,6 +121,8 @@ impl App {
                 self.error = Some(e);
                 self.server_state = ServerState::Listening;
                 net::set_recording(false);
+                net::set_monitoring(false);
+                self.monitoring = false;
             }
         }
         Task::none()
@@ -112,6 +131,7 @@ impl App {
     pub fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             Subscription::run(audio::enumerate_devices_stream),
+            Subscription::run(audio::enumerate_output_devices_stream),
             net::server_subscription(self.selected_device.clone()),
         ])
     }
@@ -120,57 +140,107 @@ impl App {
         Theme::Dark
     }
 
-    // ---------------------------------------------------------------------------
-    // View
-    // ---------------------------------------------------------------------------
-
     pub fn view(&self) -> Element<Message> {
-        let device_row = column![
-            text("Audio input").size(12),
+        let connected = matches!(
+            &self.server_state,
+            ServerState::Connected(_) | ServerState::Recording(_)
+        );
+
+        // ── Capture section ───────────────────────────────────────────────
+        let capture_col = column![
+            text("Audio input (mic)").size(12),
             pick_list(
                 self.devices.as_slice(),
                 self.selected_device.as_ref(),
                 Message::DeviceSelected,
             )
-            .placeholder("Select audio input device...")
+            .placeholder("Select input..."),
         ]
         .spacing(4);
 
+        // ── Output / monitor section ───────────────────────────────────────
+        let output_col = column![
+            text("Audio output (DAW monitor)").size(12),
+            pick_list(
+                self.output_devices.as_slice(),
+                self.selected_output.as_ref(),
+                Message::OutputDeviceSelected,
+            )
+            .placeholder("Select output..."),
+        ]
+        .spacing(4);
+
+        // ── Status ─────────────────────────────────────────────────────────
         let status = match &self.server_state {
-            ServerState::Listening => "Waiting for plugin connection...".to_string(),
-            ServerState::Connected(addr) => format!("Plugin connected — {addr}"),
+            ServerState::Listening => "Waiting for receiver connection...".to_string(),
+            ServerState::Connected(addr) => format!("Receiver connected — {addr}"),
             ServerState::Recording(addr) => format!("● Streaming — {addr}"),
         };
 
-        let record_btn = self.record_button();
+        // ── Record button ──────────────────────────────────────────────────
+        let (rec_label, rec_recording) = match &self.server_state {
+            ServerState::Recording(_) => ("⏹  STOP", true),
+            _ => ("⏺  REC", false),
+        };
+        let rec_btn = {
+            let b = button(text(rec_label).size(20))
+                .padding([18, 44])
+                .style(if rec_recording {
+                    button::danger
+                } else {
+                    button::primary
+                });
+            if connected {
+                b.on_press(Message::RecordToggled)
+            } else {
+                b
+            }
+        };
+
+        // ── Monitor button ─────────────────────────────────────────────────
+        let mon_btn = {
+            let label = if self.monitoring {
+                "⏹  Stop monitor"
+            } else {
+                "▶  Monitor DAW"
+            };
+            let b = button(text(label).size(14))
+                .padding([10, 24])
+                .style(if self.monitoring {
+                    button::danger
+                } else {
+                    button::secondary
+                });
+            if connected && self.selected_output.is_some() {
+                b.on_press(Message::MonitorToggled)
+            } else {
+                b
+            }
+        };
 
         let mut content = column![
             text("Telepath Host").size(26),
-            vertical_space().height(16),
-            device_row,
             vertical_space().height(12),
-            text(status),
-            vertical_space().height(32),
-            record_btn,
+            capture_col,
+            vertical_space().height(8),
+            output_col,
+            vertical_space().height(12),
+            text(status).size(12),
+            vertical_space().height(24),
+            rec_btn,
+            vertical_space().height(12),
+            mon_btn,
         ]
         .spacing(0)
         .align_x(iced::Alignment::Center)
-        .max_width(340);
+        .max_width(360);
 
-        // Stats — only visible while connected or recording
-        if matches!(
-            &self.server_state,
-            ServerState::Connected(_) | ServerState::Recording(_)
-        ) {
+        if connected {
             let rtt = self.rtt_ms.map_or("—".into(), |ms| format!("{ms:.1} ms"));
-
-            content = content.push(vertical_space().height(24)).push(
-                row![
-                    text(format!("Level  {:.1} dBFS", self.level_db)).size(12),
-                    text(format!("   RTT  {rtt}")).size(12),
-                ]
-                .spacing(0),
-            );
+            content = content.push(vertical_space().height(16)).push(row![
+                text(format!("Level  {:.1} dBFS", self.level_db)).size(12),
+                text(format!("   RTT  {rtt}")).size(12),
+            ]);
         }
 
         if let Some(err) = &self.error {
@@ -182,27 +252,5 @@ impl App {
         }
 
         container(content).padding(28).center_x(iced::Fill).into()
-    }
-
-    fn record_button(&self) -> Element<Message> {
-        let (label, is_recording, enabled) = match &self.server_state {
-            ServerState::Listening => ("⏺  REC", false, false),
-            ServerState::Connected(_) => ("⏺  REC", false, true),
-            ServerState::Recording(_) => ("⏹  STOP", true, true),
-        };
-
-        let btn = button(text(label).size(22))
-            .padding([22, 52])
-            .style(if is_recording {
-                button::danger
-            } else {
-                button::primary
-            });
-
-        if enabled {
-            btn.on_press(Message::RecordToggled).into()
-        } else {
-            btn.into()
-        }
     }
 }

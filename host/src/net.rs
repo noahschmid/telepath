@@ -21,14 +21,24 @@ use crate::audio;
 // ---------------------------------------------------------------------------
 
 static RECORDING: AtomicBool = AtomicBool::new(false);
+static MONITORING: AtomicBool = AtomicBool::new(false);
 static SELECTED_DEVICE: Mutex<Option<String>> = Mutex::new(None);
+static OUTPUT_DEVICE: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn set_recording(val: bool) {
     RECORDING.store(val, Ordering::Release);
 }
 
+pub fn set_monitoring(val: bool) {
+    MONITORING.store(val, Ordering::Release);
+}
+
 pub fn set_device(dev: Option<String>) {
     *SELECTED_DEVICE.lock().unwrap() = dev;
+}
+
+pub fn set_output_device(dev: Option<String>) {
+    *OUTPUT_DEVICE.lock().unwrap() = dev;
 }
 
 // ---------------------------------------------------------------------------
@@ -54,6 +64,51 @@ fn server_stream(device: Option<String>) -> impl iced::futures::Stream<Item = Me
             }
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// Return audio task — receives DAW playback from receiver, plays locally
+// ---------------------------------------------------------------------------
+
+async fn return_audio_task(udp: UdpSocket, sample_rate: u32) {
+    use common::packet::{AudioPacket, MAX_PACKET_BYTES};
+
+    let output_device = OUTPUT_DEVICE.lock().unwrap().clone();
+    let Some(device_name) = output_device else {
+        eprintln!("[host] no output device selected — return audio disabled");
+        return;
+    };
+
+    let (mut prod, _shutdown) = match audio::start_playback(&device_name, sample_rate) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[host] failed to start playback: {e}");
+            return;
+        }
+    };
+
+    eprintln!("[host] return audio ready on {device_name}");
+    let mut buf = vec![0u8; MAX_PACKET_BYTES];
+
+    loop {
+        match udp.recv(&mut buf).await {
+            Ok(n) => {
+                if !MONITORING.load(Ordering::Acquire) {
+                    continue;
+                }
+                if let Ok(pkt) = AudioPacket::decode(&buf[..n]) {
+                    use ringbuf::traits::Producer;
+                    for s in &pkt.samples {
+                        let _ = prod.try_push(*s);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[host] return UDP error: {e}");
+                break;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +168,11 @@ async fn run_session(
     })
     .await??;
 
+    // Bind the return audio UDP socket before sending ServerHello
+    // so we can include its port in the handshake.
+    let return_udp = UdpSocket::bind("0.0.0.0:0").await?;
+    let return_udp_port = return_udp.local_addr()?.port();
+
     write_message(
         &mut tcp_tx,
         &ServerHello {
@@ -120,6 +180,7 @@ async fn run_session(
             sample_rate,
             channels: 1,
             device_name: device_name.to_string(),
+            return_udp_port,
         },
     )
     .await?;
@@ -143,6 +204,10 @@ async fn run_session(
     let plugin_udp_addr = format!("{}:{}", plugin_ip, client_hello.udp_listen_port);
     eprintln!("[host] handshake OK — audio → {plugin_udp_addr}");
     let _ = tx.try_send(Message::PluginConnected(plugin_ip.clone()));
+
+    // Spawn return audio task — receives DAW playback from receiver and
+    // plays it to the selected output device on this machine.
+    tokio::spawn(return_audio_task(return_udp, sample_rate));
 
     // ------------------------------------------------------------------
     // 2. Audio capture + UDP socket

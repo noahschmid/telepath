@@ -14,6 +14,8 @@ pub struct ServerHello {
     pub sample_rate: u32,
     pub channels: u8,
     pub device_name: String,
+    /// UDP port on the host that the receiver should send return audio to.
+    pub return_udp_port: u16,
 }
 
 /// Sent by the receiver in response to ServerHello.

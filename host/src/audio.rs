@@ -1,5 +1,6 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use iced::futures::stream;
+use ringbuf::traits::Split;
 
 use crate::app::Message;
 
@@ -202,6 +203,132 @@ where
 
     stream.play()?;
     Ok(stream)
+}
+
+// ---------------------------------------------------------------------------
+// Output device enumeration + playback (for DAW monitor return stream)
+// ---------------------------------------------------------------------------
+
+pub fn list_output_devices() -> Vec<String> {
+    let host = cpal::default_host();
+    host.output_devices()
+        .map(|devs| devs.filter_map(|d| d.name().ok()).collect())
+        .unwrap_or_default()
+}
+
+pub fn enumerate_output_devices_stream() -> impl iced::futures::Stream<Item = crate::app::Message> {
+    use iced::futures::stream;
+    stream::once(async {
+        let devices = tokio::task::spawn_blocking(list_output_devices)
+            .await
+            .unwrap_or_default();
+        crate::app::Message::OutputDevicesLoaded(devices)
+    })
+}
+
+pub fn output_device_sample_rate(device_name: &str) -> Result<u32, CaptureError> {
+    let host = cpal::default_host();
+    let device = host
+        .output_devices()?
+        .find(|d| d.name().ok().as_deref() == Some(device_name))
+        .ok_or_else(|| CaptureError::DeviceNotFound(device_name.to_string()))?;
+    Ok(device.default_output_config()?.sample_rate().0)
+}
+
+/// Start playing audio to the named output device.
+/// Returns a ring buffer producer (network task pushes into it) and a
+/// shutdown sender. cpal::Stream is !Send so lives in its own thread.
+pub fn start_playback(
+    device_name: &str,
+    sample_rate: u32,
+) -> Result<(ringbuf::HeapProd<f32>, tokio::sync::oneshot::Sender<()>), CaptureError> {
+    let device_name = device_name.to_string();
+
+    {
+        let host = cpal::default_host();
+        host.output_devices()?
+            .find(|d| d.name().ok().as_deref() == Some(&device_name))
+            .ok_or_else(|| CaptureError::DeviceNotFound(device_name.clone()))?;
+    }
+
+    let buf_capacity = (0.5 * sample_rate as f64) as usize;
+    let (prod, cons) = ringbuf::HeapRb::<f32>::new(buf_capacity).split();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    std::thread::Builder::new()
+        .name(format!("cpal-playback-{device_name}"))
+        .spawn(move || playback_thread(device_name, sample_rate, cons, shutdown_rx))
+        .map_err(|e| CaptureError::DeviceNotFound(e.to_string()))?;
+
+    Ok((prod, shutdown_tx))
+}
+
+fn playback_thread(
+    device_name: String,
+    sample_rate: u32,
+    mut cons: ringbuf::HeapCons<f32>,
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    use cpal::traits::StreamTrait;
+    use ringbuf::traits::Consumer;
+
+    let host = cpal::default_host();
+    let device = match host
+        .output_devices()
+        .ok()
+        .and_then(|mut d| d.find(|d| d.name().ok().as_deref() == Some(&device_name)))
+    {
+        Some(d) => d,
+        None => {
+            eprintln!("[audio] output device not found: {device_name}");
+            return;
+        }
+    };
+
+    let default_config = match device.default_output_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[audio] output config error: {e}");
+            return;
+        }
+    };
+
+    let channels = default_config.channels() as usize;
+    let config = cpal::StreamConfig {
+        channels: channels as u16,
+        sample_rate: cpal::SampleRate(sample_rate),
+        buffer_size: cpal::BufferSize::Default,
+    };
+
+    let stream = match device.build_output_stream(
+        &config,
+        move |data: &mut [f32], _| {
+            let frames = data.len() / channels;
+            for frame in 0..frames {
+                let s = cons.try_pop().unwrap_or(0.0);
+                for ch in 0..channels {
+                    data[frame * channels + ch] = s;
+                }
+            }
+        },
+        |err| eprintln!("[audio] output stream error: {err}"),
+        None,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[audio] failed to build output stream: {e}");
+            return;
+        }
+    };
+
+    if let Err(e) = stream.play() {
+        eprintln!("[audio] failed to play output stream: {e}");
+        return;
+    }
+
+    eprintln!("[audio] playback stream running on {device_name}");
+    let _ = shutdown_rx.blocking_recv();
+    drop(stream);
 }
 
 // ---------------------------------------------------------------------------
