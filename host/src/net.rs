@@ -3,14 +3,14 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::time::{Duration, interval};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::time::{interval, Duration};
 
 use common::framing::{read_message, write_message};
-use common::packet::{AudioPacket, now_us};
+use common::packet::{now_us, AudioPacket};
 use common::protocol::{
-    ClientHello, HandshakeResult, HostMessage, ReceiverMessage,
-    ServerHello, DEFAULT_PORT, PROTOCOL_VERSION,
+    ClientHello, HandshakeResult, HostMessage, ReceiverMessage, ServerHello, DEFAULT_PORT,
+    PROTOCOL_VERSION,
 };
 
 use crate::app::Message;
@@ -105,9 +105,7 @@ async fn run_session(
     // 1. Handshake
     // ------------------------------------------------------------------
 
-    let device_name = device
-        .as_deref()
-        .ok_or("no audio device selected")?;
+    let device_name = device.as_deref().ok_or("no audio device selected")?;
 
     let sample_rate = tokio::task::spawn_blocking({
         let name = device_name.to_string();
@@ -169,7 +167,7 @@ async fn run_session(
     // ------------------------------------------------------------------
 
     let (tcp_in_tx, mut tcp_in_rx) =
-        tokio::sync::mpsc::channel::<Result<PluginMessage, String>>(16);
+        tokio::sync::mpsc::channel::<Result<ReceiverMessage, String>>(16);
 
     tokio::spawn(async move {
         loop {
@@ -264,7 +262,6 @@ async fn run_session(
                             eprintln!("[host] plugin requested disconnect");
                             break;
                         }
-                        ReceiverMessage::RecordStart | ReceiverMessage::RecordStop => {}
                     }
                 }
             }

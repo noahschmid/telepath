@@ -47,7 +47,10 @@ pub enum ReceiverMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HostMessage {
     /// Echo of a Ping for RTT measurement.
-    Pong { seq: u32, timestamp_us: u64 },
+    Pong {
+        seq: u32,
+        timestamp_us: u64,
+    },
     StreamStats {
         packets_sent: u64,
         packets_dropped: u32,
@@ -72,11 +75,15 @@ pub enum SessionError {
 impl std::fmt::Display for SessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::VersionMismatch { got, expected } =>
-                write!(f, "protocol version mismatch: got {got}, expected {expected}"),
+            Self::VersionMismatch { got, expected } => write!(
+                f,
+                "protocol version mismatch: got {got}, expected {expected}"
+            ),
             Self::DeviceUnavailable => write!(f, "audio device unavailable"),
-            Self::SampleRateMismatch { got, expected } =>
-                write!(f, "sample rate mismatch: device {got} Hz, DAW {expected} Hz"),
+            Self::SampleRateMismatch { got, expected } => write!(
+                f,
+                "sample rate mismatch: device {got} Hz, DAW {expected} Hz"
+            ),
             Self::Internal(s) => write!(f, "internal error: {s}"),
         }
     }

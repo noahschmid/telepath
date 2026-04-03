@@ -1,4 +1,4 @@
-use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use iced::futures::stream;
 
 use crate::app::Message;
