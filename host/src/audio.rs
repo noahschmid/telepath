@@ -226,6 +226,7 @@ pub fn enumerate_output_devices_stream() -> impl iced::futures::Stream<Item = cr
     })
 }
 
+#[allow(dead_code)]
 pub fn output_device_sample_rate(device_name: &str) -> Result<u32, CaptureError> {
     let host = cpal::default_host();
     let device = host
@@ -336,6 +337,7 @@ fn playback_thread(
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
+#[allow(dead_code)]
 pub enum CaptureError {
     #[error("device not found: {0}")]
     DeviceNotFound(String),

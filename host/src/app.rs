@@ -1,4 +1,4 @@
-use iced::widget::{button, column, container, pick_list, row, text, vertical_space};
+use iced::widget::{button, column, container, pick_list, text, vertical_space};
 use iced::{Color, Element, Subscription, Task, Theme};
 
 use crate::{audio, net};
@@ -17,7 +17,6 @@ pub struct App {
     selected_device: Option<String>,
     server_state: ServerState,
     level_db: f32,
-    rtt_ms: Option<f32>,
 
     // Monitoring (DAW playback → Scarlett)
     output_devices: Vec<String>,
@@ -34,7 +33,6 @@ impl Default for App {
             selected_device: None,
             server_state: ServerState::Listening,
             level_db: -60.0,
-            rtt_ms: None,
             output_devices: vec![],
             selected_output: None,
             monitoring: false,
@@ -52,7 +50,6 @@ pub enum Message {
     PluginDisconnected,
     RecordToggled,
     LevelUpdated(f32),
-    RttUpdated(f32),
     ServerError(String),
 
     // Monitoring side
@@ -99,7 +96,6 @@ impl App {
                 net::set_monitoring(false);
                 self.monitoring = false;
                 self.server_state = ServerState::Listening;
-                self.rtt_ms = None;
                 self.level_db = -60.0;
             }
             Message::RecordToggled => match &self.server_state {
@@ -116,7 +112,6 @@ impl App {
                 ServerState::Listening => {}
             },
             Message::LevelUpdated(db) => self.level_db = db,
-            Message::RttUpdated(ms) => self.rtt_ms = Some(ms),
             Message::ServerError(e) => {
                 self.error = Some(e);
                 self.server_state = ServerState::Listening;
@@ -140,7 +135,7 @@ impl App {
         Theme::Dark
     }
 
-    pub fn view(&self) -> Element<Message> {
+    pub fn view(&self) -> Element<'_, Message> {
         let connected = matches!(
             &self.server_state,
             ServerState::Connected(_) | ServerState::Recording(_)
@@ -236,11 +231,9 @@ impl App {
         .max_width(360);
 
         if connected {
-            let rtt = self.rtt_ms.map_or("—".into(), |ms| format!("{ms:.1} ms"));
-            content = content.push(vertical_space().height(16)).push(row![
-                text(format!("Level  {:.1} dBFS", self.level_db)).size(12),
-                text(format!("   RTT  {rtt}")).size(12),
-            ]);
+            content = content
+                .push(vertical_space().height(16))
+                .push(text(format!("Level  {:.1} dBFS", self.level_db)).size(12));
         }
 
         if let Some(err) = &self.error {

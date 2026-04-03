@@ -1,335 +1,262 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use iced::widget::{button, column, container, pick_list, text, text_input, vertical_space};
+use iced::{Color, Element, Subscription, Task, Theme};
 
-use ringbuf::traits::Producer;
-use tokio::net::{TcpStream, UdpSocket};
-use tokio::time::{interval, Duration};
+use crate::{audio, net};
 
-use common::framing::{read_message, write_message};
-use common::packet::{now_us, AudioPacket, MAX_PACKET_BYTES};
-use common::protocol::{
-    ClientHello, HandshakeResult, HostMessage, ReceiverMessage, ServerHello, DEFAULT_PORT,
-    PROTOCOL_VERSION,
-};
-
-use crate::app::Message;
-use crate::audio;
-
-// ---------------------------------------------------------------------------
-// Disconnect flag — set by App::update(DisconnectPressed)
-// ---------------------------------------------------------------------------
-
-static DISCONNECT_REQUESTED: AtomicBool = AtomicBool::new(false);
-static RETURN_ENABLED: AtomicBool = AtomicBool::new(false);
-static RETURN_DEVICE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-pub fn request_disconnect() {
-    DISCONNECT_REQUESTED.store(true, Ordering::Release);
+#[derive(Debug, Default, Clone, PartialEq)]
+pub enum ConnectionState {
+    #[default]
+    Disconnected,
+    Connecting,
+    Connected,
 }
 
-pub fn set_return_enabled(val: bool) {
-    RETURN_ENABLED.store(val, Ordering::Release);
-}
-
-pub fn set_return_device(dev: Option<String>) {
-    *RETURN_DEVICE.lock().unwrap() = dev;
-}
-
-// ---------------------------------------------------------------------------
-// Subscription
-// ---------------------------------------------------------------------------
-
-pub fn session_subscription(
+#[derive(Debug)]
+pub struct App {
     host: String,
-    port: u16,
-    device: String,
-) -> iced::Subscription<Message> {
-    iced::Subscription::run_with_id(
-        (host.clone(), port, device.clone()),
-        session_stream(host, port, device),
-    )
+    port: String,
+    connection_state: ConnectionState,
+    latency_us: u32,
+    error: Option<String>,
+
+    output_devices: Vec<String>,
+    selected_output: Option<String>,
+
+    input_devices: Vec<String>,
+    selected_input: Option<String>,
+    return_enabled: bool,
 }
 
-fn session_stream(
-    host: String,
-    port: u16,
-    device: String,
-) -> impl iced::futures::Stream<Item = Message> {
-    iced::stream::channel(32, move |mut tx| async move {
-        DISCONNECT_REQUESTED.store(false, Ordering::Release);
-
-        match run_session(host, port, device, &mut tx).await {
-            Ok(()) => {
-                let _ = tx.try_send(Message::Disconnected);
-            }
-            Err(e) => {
-                let _ = tx.try_send(Message::Error(e.to_string()));
-            }
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            host: "192.168.1.".to_string(),
+            port: "7271".to_string(),
+            connection_state: ConnectionState::Disconnected,
+            latency_us: 0,
+            error: None,
+            output_devices: vec![],
+            selected_output: None,
+            input_devices: vec![],
+            selected_input: None,
+            return_enabled: false,
         }
-    })
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Session
-// ---------------------------------------------------------------------------
-
-async fn run_session(
-    host: String,
-    port: u16,
-    device: String,
-    tx: &mut iced::futures::channel::mpsc::Sender<Message>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // ------------------------------------------------------------------
-    // 1. TCP connect
-    // ------------------------------------------------------------------
-    let addr = format!("{host}:{port}");
-    let stream = TcpStream::connect(&addr)
-        .await
-        .map_err(|e| format!("TCP connect to {addr} failed: {e}"))?;
-
-    let (mut tcp_rx, mut tcp_tx) = stream.into_split();
-
-    // ------------------------------------------------------------------
-    // 2. Receive ServerHello
-    // ------------------------------------------------------------------
-    let server_hello: ServerHello = read_message(&mut tcp_rx).await?;
-
-    if server_hello.version != PROTOCOL_VERSION {
-        return Err(format!(
-            "host protocol version {} — receiver expects {PROTOCOL_VERSION}",
-            server_hello.version
-        )
-        .into());
-    }
-
-    eprintln!(
-        "[receiver] host device: {} @ {} Hz",
-        server_hello.device_name, server_hello.sample_rate
-    );
-
-    // ------------------------------------------------------------------
-    // 3. Query our output device sample rate + bind UDP
-    // ------------------------------------------------------------------
-    let device_clone = device.clone();
-    let output_sample_rate =
-        tokio::task::spawn_blocking(move || audio::output_device_sample_rate(&device_clone))
-            .await?
-            .map_err(|e| format!("output device error: {e}"))?;
-
-    let udp = UdpSocket::bind("0.0.0.0:0").await?;
-    let udp_listen_port = udp.local_addr()?.port();
-
-    // ------------------------------------------------------------------
-    // 4. Send ClientHello
-    // ------------------------------------------------------------------
-    write_message(
-        &mut tcp_tx,
-        &ClientHello {
-            version: PROTOCOL_VERSION,
-            requested_sample_rate: output_sample_rate,
-            udp_listen_port,
-        },
-    )
-    .await?;
-
-    // ------------------------------------------------------------------
-    // 5. Receive HandshakeResult
-    // ------------------------------------------------------------------
-    let result: HandshakeResult = read_message(&mut tcp_rx).await?;
-    match result {
-        HandshakeResult::Ready => {}
-        HandshakeResult::Error(e) => return Err(e.to_string().into()),
-    }
-
-    eprintln!("[receiver] session ready — UDP on port {udp_listen_port}");
-    let _ = tx.try_send(Message::Connected);
-
-    // Spawn return stream task — captures DAW loopback and sends to host.
-    let return_host_addr = format!("{host}:{}", server_hello.return_udp_port);
-    let return_task = tokio::spawn(return_stream_task(
-        return_host_addr,
-        server_hello.sample_rate,
-    ));
-
-    // ------------------------------------------------------------------
-    // 6. Start audio playback
-    // ------------------------------------------------------------------
-    // Use the host's sample rate (what it will actually send).
-    let (mut audio_prod, _playback_shutdown) =
-        audio::start_playback(&device, server_hello.sample_rate)
-            .map_err(|e| format!("playback start failed: {e}"))?;
-
-    // ------------------------------------------------------------------
-    // 7. TCP reader task (avoids dropping partial reads in select!)
-    // ------------------------------------------------------------------
-    let (tcp_in_tx, mut tcp_in_rx) = tokio::sync::mpsc::channel::<Result<HostMessage, String>>(16);
-
-    tokio::spawn(async move {
-        loop {
-            match read_message::<_, HostMessage>(&mut tcp_rx).await {
-                Ok(msg) => {
-                    if tcp_in_tx.send(Ok(msg)).await.is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    let _ = tcp_in_tx.send(Err(e.to_string())).await;
-                    break;
-                }
-            }
-        }
-    });
-
-    // ------------------------------------------------------------------
-    // 8. Main session loop
-    // ------------------------------------------------------------------
-    let mut udp_buf = vec![0u8; MAX_PACKET_BYTES];
-    let mut ping_seq = 0u32;
-    let mut ping_timer = interval(Duration::from_millis(500));
-    ping_timer.tick().await;
-
-    loop {
-        // Check for user-requested disconnect
-        if DISCONNECT_REQUESTED.swap(false, Ordering::AcqRel) {
-            eprintln!("[receiver] disconnect requested — sending Disconnect");
-            let _ = write_message(&mut tcp_tx, &ReceiverMessage::Disconnect).await;
-            break;
-        }
-
-        tokio::select! {
-            // Ping timer
-            _ = ping_timer.tick() => {
-                write_message(&mut tcp_tx, &ReceiverMessage::Ping {
-                    seq: ping_seq,
-                    timestamp_us: now_us(),
-                })
-                .await?;
-                ping_seq = ping_seq.wrapping_add(1);
-            }
-
-            // TCP from host
-            maybe_msg = tcp_in_rx.recv() => {
-                match maybe_msg {
-                    None => {
-                        eprintln!("[receiver] TCP reader closed");
-                        break;
-                    }
-                    Some(Err(e)) => return Err(e.into()),
-                    Some(Ok(msg)) => match msg {
-                        HostMessage::Pong { timestamp_us, .. } => {
-                            let rtt_us = now_us().saturating_sub(timestamp_us);
-                            let one_way_us = (rtt_us / 2) as u32;
-                            let _ = tx.try_send(Message::LatencyUpdated(one_way_us));
-                        }
-                        HostMessage::StreamStats { packets_dropped, .. } => {
-                            if packets_dropped > 0 {
-                                eprintln!("[receiver] {packets_dropped} packets dropped by host");
-                            }
-                        }
-                        HostMessage::Error(e) => {
-                            return Err(format!("host error: {e}").into());
-                        }
-                    }
-                }
-            }
-
-            // Incoming UDP audio
-            result = udp.recv(&mut udp_buf) => {
-                let n = result?;
-                match AudioPacket::decode(&udp_buf[..n]) {
-                    Ok(pkt) => {
-                        for &s in &pkt.samples {
-                            let _ = audio_prod.try_push(s);
-                        }
-                    }
-                    Err(e) => eprintln!("[receiver] bad UDP packet: {e}"),
-                }
-            }
-        }
-    }
-
-    return_task.abort();
-    Ok(())
+#[derive(Debug, Clone)]
+pub enum Message {
+    HostChanged(String),
+    PortChanged(String),
+    ConnectPressed,
+    DisconnectPressed,
+    Connected,
+    Disconnected,
+    LatencyUpdated(u32),
+    Error(String),
+    OutputDevicesLoaded(Vec<String>),
+    OutputDeviceSelected(String),
+    InputDevicesLoaded(Vec<String>),
+    InputDeviceSelected(String),
+    ReturnToggled,
 }
 
-// ---------------------------------------------------------------------------
-// Return stream task
-// Captures DAW playback from the selected input device and streams it
-// back to the host over UDP. Runs independently; toggled via RETURN_ENABLED.
-// ---------------------------------------------------------------------------
-
-async fn return_stream_task(host_addr: String, sample_rate: u32) {
-    use common::packet::{now_us, AudioPacket, MAX_FRAMES};
-    use ringbuf::traits::Producer;
-
-    let udp = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[return] failed to bind UDP: {e}");
-            return;
+impl App {
+    pub fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::HostChanged(v) => self.host = v,
+            Message::PortChanged(v) => {
+                if v.chars().all(|c| c.is_ascii_digit()) {
+                    self.port = v;
+                }
+            }
+            Message::OutputDevicesLoaded(devs) => {
+                if self.selected_output.is_none() {
+                    self.selected_output = devs.first().cloned();
+                }
+                self.output_devices = devs;
+            }
+            Message::OutputDeviceSelected(d) => self.selected_output = Some(d),
+            Message::InputDevicesLoaded(devs) => {
+                if self.selected_input.is_none() {
+                    self.selected_input = devs.first().cloned();
+                    net::set_return_device(self.selected_input.clone());
+                }
+                self.input_devices = devs;
+            }
+            Message::InputDeviceSelected(d) => {
+                net::set_return_device(Some(d.clone()));
+                self.selected_input = Some(d);
+            }
+            Message::ReturnToggled => {
+                self.return_enabled = !self.return_enabled;
+                net::set_return_enabled(self.return_enabled);
+            }
+            Message::ConnectPressed => {
+                self.connection_state = ConnectionState::Connecting;
+                self.error = None;
+                self.latency_us = 0;
+                self.return_enabled = false;
+                net::set_return_enabled(false);
+            }
+            Message::DisconnectPressed => {
+                net::request_disconnect();
+                self.connection_state = ConnectionState::Disconnected;
+                self.latency_us = 0;
+                self.return_enabled = false;
+                net::set_return_enabled(false);
+            }
+            Message::Connected => self.connection_state = ConnectionState::Connected,
+            Message::Disconnected => {
+                self.connection_state = ConnectionState::Disconnected;
+                self.latency_us = 0;
+                self.return_enabled = false;
+            }
+            Message::LatencyUpdated(us) => self.latency_us = us,
+            Message::Error(e) => {
+                self.error = Some(e);
+                self.connection_state = ConnectionState::Disconnected;
+                self.return_enabled = false;
+            }
         }
-    };
-    if let Err(e) = udp.connect(&host_addr).await {
-        eprintln!("[return] failed to connect to {host_addr}: {e}");
-        return;
+        Task::none()
     }
 
-    let mut capture_rx: Option<tokio::sync::mpsc::Receiver<Vec<f32>>> = None;
-    let mut capture_shutdown: Option<tokio::sync::oneshot::Sender<()>> = None;
-    let mut currently_enabled = false;
-    let mut seq = 0u32;
+    pub fn subscription(&self) -> Subscription<Message> {
+        let subs = vec![
+            Subscription::run(audio::enumerate_output_devices_stream),
+            Subscription::run(audio::enumerate_input_devices_stream),
+        ];
 
-    loop {
-        let enabled = RETURN_ENABLED.load(Ordering::Acquire);
-
-        // Start or stop capture when toggle changes
-        if enabled != currently_enabled {
-            if enabled {
-                let device = RETURN_DEVICE.lock().unwrap().clone();
-                if let Some(dev) = device {
-                    match crate::audio::start_capture(&dev) {
-                        Ok((rx, shutdown)) => {
-                            capture_rx = Some(rx);
-                            capture_shutdown = Some(shutdown);
-                            eprintln!("[return] capture started on {dev}");
-                        }
-                        Err(e) => eprintln!("[return] capture failed: {e}"),
-                    }
-                }
-            } else {
-                drop(capture_shutdown.take());
-                capture_rx = None;
-                eprintln!("[return] capture stopped");
-            }
-            currently_enabled = enabled;
-        }
-
-        if let Some(ref mut rx) = capture_rx {
-            match rx.recv().await {
-                Some(frames) => {
-                    for chunk in frames.chunks(MAX_FRAMES) {
-                        let pkt = AudioPacket {
-                            seq,
-                            timestamp_us: now_us(),
-                            samples: chunk.to_vec(),
-                        };
-                        if let Ok(bytes) = pkt.encode() {
-                            let _ = udp.send(&bytes).await;
-                        }
-                        seq = seq.wrapping_add(1);
-                    }
-                }
-                None => {
-                    // Capture device disappeared
-                    eprintln!("[return] capture device closed unexpectedly");
-                    capture_shutdown = None;
-                    capture_rx = None;
-                    currently_enabled = false;
-                    RETURN_ENABLED.store(false, Ordering::Release);
-                }
-            }
+        if self.connection_state != ConnectionState::Disconnected {
+            let port = self.port.parse::<u16>().unwrap_or(7271);
+            Subscription::batch(
+                subs.into_iter()
+                    .chain(std::iter::once(net::session_subscription(
+                        self.host.clone(),
+                        port,
+                        self.selected_output.clone().unwrap_or_default(),
+                    ))),
+            )
         } else {
-            // Nothing to send — sleep to avoid busy-loop
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            Subscription::batch(subs)
         }
+    }
+
+    pub fn theme(&self) -> Theme {
+        Theme::Dark
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        let connected = self.connection_state == ConnectionState::Connected;
+        let can_connect = self.connection_state == ConnectionState::Disconnected
+            && !self.host.is_empty()
+            && self.selected_output.is_some();
+
+        let config_col = column![
+            text("Host address").size(12),
+            text_input("192.168.x.x", &self.host)
+                .on_input(Message::HostChanged)
+                .padding(8),
+            vertical_space().height(4),
+            text("Port").size(12),
+            text_input("7271", &self.port)
+                .on_input(Message::PortChanged)
+                .padding(8),
+        ]
+        .spacing(4);
+
+        let output_col = column![
+            text("Output device (VB-Cable / loopback)").size(12),
+            pick_list(
+                self.output_devices.as_slice(),
+                self.selected_output.as_ref(),
+                Message::OutputDeviceSelected,
+            )
+            .placeholder("Select output device..."),
+        ]
+        .spacing(4);
+
+        let ret_btn_label = if self.return_enabled {
+            "⏹  Stop return"
+        } else {
+            "▶  Send DAW audio to host"
+        };
+        let ret_btn = {
+            let b = button(text(ret_btn_label).size(13)).padding([8, 20]).style(
+                if self.return_enabled {
+                    button::danger
+                } else {
+                    button::secondary
+                },
+            );
+            if connected && self.selected_input.is_some() {
+                b.on_press(Message::ReturnToggled)
+            } else {
+                b
+            }
+        };
+        let return_col = column![
+            text("Return stream input (DAW loopback)").size(12),
+            pick_list(
+                self.input_devices.as_slice(),
+                self.selected_input.as_ref(),
+                Message::InputDeviceSelected,
+            )
+            .placeholder("Select input device..."),
+            vertical_space().height(4),
+            ret_btn,
+        ]
+        .spacing(4);
+
+        let connect_btn = match self.connection_state {
+            ConnectionState::Disconnected => button("Connect")
+                .padding([10, 32])
+                .on_press_maybe(can_connect.then_some(Message::ConnectPressed)),
+            ConnectionState::Connecting => button("Connecting...").padding([10, 32]),
+            ConnectionState::Connected => button("Disconnect")
+                .padding([10, 32])
+                .style(button::danger)
+                .on_press(Message::DisconnectPressed),
+        };
+
+        let latency_section = if connected {
+            let ms = self.latency_us as f32 / 1000.0;
+            column![
+                vertical_space().height(12),
+                text(format!("One-way latency: {ms:.2} ms")).size(13),
+                text(format!("→ set DAW track delay to {ms:.2} ms"))
+                    .size(11)
+                    .color(Color::from_rgb(0.5, 0.5, 0.5)),
+            ]
+            .spacing(4)
+        } else {
+            column![]
+        };
+
+        let mut col = column![
+            text("Telepath Receiver").size(26),
+            vertical_space().height(12),
+            config_col,
+            vertical_space().height(8),
+            output_col,
+            vertical_space().height(8),
+            return_col,
+            vertical_space().height(16),
+            connect_btn,
+            latency_section,
+        ]
+        .spacing(0)
+        .max_width(400);
+
+        if let Some(err) = &self.error {
+            col = col.push(vertical_space().height(8)).push(
+                text(err.as_str())
+                    .size(12)
+                    .color(Color::from_rgb(0.85, 0.3, 0.3)),
+            );
+        }
+
+        container(col).padding(28).into()
     }
 }
