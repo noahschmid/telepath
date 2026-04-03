@@ -1,11 +1,9 @@
 [workspace]
-members = ["host", "common","plugin","xtask"]
+members = ["host", "common","receiver"]
 
 resolver = "2"
 
 [workspace.dependencies]
-nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }
 parking_lot = "0.12.5"
 ringbuf     = "0.4"
 tokio       = { version = "1", features = ["full"] }
-thiserror   = "1"

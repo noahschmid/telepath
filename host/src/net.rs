@@ -4,13 +4,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, interval};
 
 use common::framing::{read_message, write_message};
-use common::packet::{now_us, AudioPacket};
+use common::packet::{AudioPacket, now_us};
 use common::protocol::{
-    ClientHello, ClientMessage, HandshakeResult, PluginMessage, ServerHello, DEFAULT_PORT,
-    PROTOCOL_VERSION,
+    ClientHello, HandshakeResult, HostMessage, ReceiverMessage,
+    ServerHello, DEFAULT_PORT, PROTOCOL_VERSION,
 };
 
 use crate::app::Message;
@@ -105,7 +105,9 @@ async fn run_session(
     // 1. Handshake
     // ------------------------------------------------------------------
 
-    let device_name = device.as_deref().ok_or("no audio device selected")?;
+    let device_name = device
+        .as_deref()
+        .ok_or("no audio device selected")?;
 
     let sample_rate = tokio::task::spawn_blocking({
         let name = device_name.to_string();
@@ -171,7 +173,7 @@ async fn run_session(
 
     tokio::spawn(async move {
         loop {
-            match read_message::<_, PluginMessage>(&mut tcp_rx).await {
+            match read_message::<_, ReceiverMessage>(&mut tcp_rx).await {
                 Ok(msg) => {
                     if tcp_in_tx.send(Ok(msg)).await.is_err() {
                         break; // session ended
@@ -251,18 +253,18 @@ async fn run_session(
                     }
                     Some(Err(e)) => return Err(e.into()),
                     Some(Ok(msg)) => match msg {
-                        PluginMessage::Ping { seq, timestamp_us } => {
-                            write_message(&mut tcp_tx, &ClientMessage::Pong {
+                        ReceiverMessage::Ping { seq, timestamp_us } => {
+                            write_message(&mut tcp_tx, &HostMessage::Pong {
                                 seq,
                                 timestamp_us,
                             })
                             .await?;
                         }
-                        PluginMessage::Disconnect => {
+                        ReceiverMessage::Disconnect => {
                             eprintln!("[host] plugin requested disconnect");
                             break;
                         }
-                        PluginMessage::RecordStart | PluginMessage::RecordStop => {}
+                        ReceiverMessage::RecordStart | ReceiverMessage::RecordStop => {}
                     }
                 }
             }
@@ -271,7 +273,7 @@ async fn run_session(
             _ = stats_timer.tick() => {
                 eprintln!("[host] sending StreamStats");
                 let db = 20.0 * level_peak.max(1e-7_f32).log10();
-                write_message(&mut tcp_tx, &ClientMessage::StreamStats {
+                write_message(&mut tcp_tx, &HostMessage::StreamStats {
                     packets_sent,
                     packets_dropped,
                     level_dbfs_x100: (db * 100.0) as i16,
